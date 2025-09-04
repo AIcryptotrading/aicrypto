@@ -1,150 +1,114 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import requests
-from datetime import datetime, timezone, timedelta
-import time
-import plotly.graph_objects as go
+import ccxt
+import datetime
 
-# --- Config
-VTZ = timezone(timedelta(hours=7))
-BINANCE_BASE = "https://api.binance.com"
-DEFAULT_SYMBOLS = [
-    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","ADAUSDT","DOTUSDT",
-    "TIAUSDT","KAVAUSDT","RENDERUSDT","AVAXUSDT","NEARUSDT","SEIUSDT"
-]
-AUTO_SCAN_INTERVAL_DEFAULT = 900
-SL_MAX_PCT = 5.0
-TP_MIN_PCT = 10.0
-HEADERS = {"User-Agent": "Mozilla/5.0 (AI-Trading-Dashboard)"}
+# ==============================
+# Khởi tạo Binance Spot
+# ==============================
+binance = ccxt.binance()
+binance.load_markets()
 
-st.set_page_config(page_title="AI Crypto Trading Dashboard", layout="wide")
-
-# --- Utils
-def now_vn_str():
-    return datetime.now(VTZ).strftime("%Y-%m-%d %H:%M:%S")
-
-def fetch_price(symbol):
+# ==============================
+# Hàm lấy giá từ Binance
+# ==============================
+def get_price(symbol):
     try:
-        url = f"{BINANCE_BASE}/api/v3/ticker/price"
-        r = requests.get(url, params={"symbol": symbol}, headers=HEADERS, timeout=8)
-        r.raise_for_status()
-        return float(r.json()["price"])
+        ticker = binance.fetch_ticker(symbol.replace("USDT", "/USDT"))
+        return float(ticker['last'])
     except Exception:
         return None
 
-def fetch_klines(symbol, interval="4h", limit=200):
+# ==============================
+# Hàm lấy dữ liệu OHLCV (để vẽ chart/trendline)
+# ==============================
+def get_ohlcv(symbol, timeframe="4h", limit=200):
     try:
-        url = f"{BINANCE_BASE}/api/v3/klines"
-        r = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, headers=HEADERS, timeout=12)
-        r.raise_for_status()
-        data = r.json()
-        df = pd.DataFrame(data, columns=[
-            "open_time","open","high","low","close","volume","close_time",
-            "qav","num_trades","taker_base","taker_quote","ignore"
-        ])
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-        for c in ["open","high","low","close","volume"]:
-            df[c] = df[c].astype(float)
+        ohlcv = binance.fetch_ohlcv(symbol.replace("USDT", "/USDT"), timeframe=timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "volume"])
+        df["time"] = pd.to_datetime(df["time"], unit="ms")
         return df
     except Exception:
         return None
 
-def linear_fit_y(y):
-    if len(y) < 2:
-        return 0, float(y.iloc[-1]) if len(y) else 0
-    x = np.arange(len(y))
-    slope, intercept = np.polyfit(x, y.values, 1)
-    return slope, intercept
+# ==============================
+# Streamlit UI
+# ==============================
+st.set_page_config(page_title="AI Crypto Trading Dashboard", layout="wide")
+st.title("📊 AI Crypto Trading Dashboard (Paper-trade)")
 
-def calc_trendlines(df):
-    if df is None or df.empty:
-        return (0,0),(0,0)
-    N = min(60, len(df))
-    highs = df["high"].tail(N).reset_index(drop=True)
-    lows  = df["low"].tail(N).reset_index(drop=True)
-    return linear_fit_y(highs), linear_fit_y(lows)
-
-def predict_line(slope, intercept, idx):
-    return slope * idx + intercept
-
-def propose_trade(symbol, price, high_t, low_t):
-    s_h, i_h = high_t
-    action, signal, note, sl, tp, rr = "WAIT","WAIT","",None,None,None
-    try:
-        pred_high = predict_line(s_h, i_h, 59)
-    except Exception:
-        pred_high = None
-    if s_h < 0 and price and pred_high and price > pred_high:
-        action="Long"; signal="BreakDownTrend"; note="Break trend giảm H4"
-        sl = round(price * (1 - SL_MAX_PCT/100), 8)
-        tp = round(price * (1 + TP_MIN_PCT/100), 8)
-        rr = round((tp-price)/max(price-sl,1e-9),2)
-    return {"Symbol":symbol,"Action":action,"Signal":signal,"SL":sl,"TP":tp,"RR":rr,"Note":note}
-
-# --- State init
-if "orders" not in st.session_state: st.session_state.orders=[]
-if "last_scan_ts" not in st.session_state: st.session_state.last_scan_ts=0
-if "scan_results" not in st.session_state: st.session_state.scan_results=[]
-
-# --- Sidebar
+# Sidebar settings
 st.sidebar.header("Settings / Controls")
-symbols_input = st.sidebar.text_area("Symbols", value=",".join(DEFAULT_SYMBOLS))
+symbols_input = st.sidebar.text_area(
+    "Symbols (comma separated)",
+    "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,ADAUSDT,DOTUSDT,TIAUSDT,KAVAUSDT,RENDERUSDT,AVAXUSDT,NEARUSDT,SEIUSDT"
+)
 symbols = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
-interval_choice = st.sidebar.selectbox("Chart interval (detail)", ["1h","4h","1d"], index=1)
-auto_scan = st.sidebar.checkbox("Auto-scan", value=True)
-scan_interval = st.sidebar.number_input("Auto-scan interval (sec)", min_value=60, value=AUTO_SCAN_INTERVAL_DEFAULT, step=60)
-st.sidebar.write("SL max %:", SL_MAX_PCT, "TP min %:", TP_MIN_PCT)
-st.sidebar.write("Time (VN):", now_vn_str())
 
-# --- Market Watch
-st.title("📈 AI Crypto Trading Dashboard (Paper-trade)")
-col1,col2 = st.columns([2,1])
-with col1:
-    st.subheader("Market Watch")
-    prices=[{"Symbol":s,"Price":fetch_price(s) or "err"} for s in symbols]
-    st.table(pd.DataFrame(prices))
-with col2:
-    st.subheader("Scan / Actions")
-    if st.button("Manual Scan now"):
-        st.session_state.scan_results=[]
-        st.session_state.last_scan_ts=time.time()
-        for s in symbols:
-            df=fetch_klines(s,"4h",200)
-            if df is None: continue
-            high_t,low_t=calc_trendlines(df)
-            price=fetch_price(s)
-            st.session_state.scan_results.append(propose_trade(s,price,high_t,low_t))
-        st.success("Manual scan done: "+now_vn_str())
-    if auto_scan and time.time()-st.session_state.last_scan_ts>scan_interval:
-        st.session_state.scan_results=[]
-        st.session_state.last_scan_ts=time.time()
-        for s in symbols:
-            df=fetch_klines(s,"4h",120)
-            if df is None: continue
-            high_t,low_t=calc_trendlines(df)
-            price=fetch_price(s)
-            st.session_state.scan_results.append(propose_trade(s,price,high_t,low_t))
-        st.rerun()
+interval = st.sidebar.selectbox("Chart interval (for detail)", ["1h", "4h", "1d"])
+auto_scan = st.sidebar.checkbox("Auto-scan market for setups", value=True)
+scan_interval = st.sidebar.number_input("Auto-scan interval (sec)", 60, 3600, 900)
+max_suggestions = st.sidebar.number_input("Max suggestions per scan", 1, 20, 6)
+sl_max = st.sidebar.number_input("SL max %", 1.0, 20.0, 5.0)
+tp_min = st.sidebar.number_input("TP min %", 1.0, 50.0, 10.0)
 
-    if st.session_state.scan_results:
-        df_scan=pd.DataFrame(st.session_state.scan_results)
-        df_pick=df_scan[df_scan["Action"]!="WAIT"].sort_values("RR",ascending=False)
-        st.table(df_pick)
+# Hiển thị thời gian VN
+vn_time = datetime.datetime.utcnow() + datetime.timedelta(hours=7)
+st.sidebar.markdown(f"**Time (VN):** {vn_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-# --- Chart
+# ==============================
+# Market Watch
+# ==============================
+market_data = []
+for sym in symbols:
+    price = get_price(sym)
+    market_data.append({"Symbol": sym, "Price": price if price else "err"})
+
+df_market = pd.DataFrame(market_data)
+st.subheader("Market Watch")
+st.table(df_market)
+
+# ==============================
+# Chart & Trendline
+# ==============================
 st.markdown("---")
 st.subheader("Chart & Trendline")
-sel=st.selectbox("Select symbol", symbols, index=0)
-df=fetch_klines(sel,interval_choice,200)
-if df is not None:
-    fig=go.Figure(data=[go.Candlestick(x=df["open_time"],open=df["open"],high=df["high"],low=df["low"],close=df["close"])])
-    try:
-        (s_h,i_h),(s_l,i_l)=calc_trendlines(df)
-        xs=[df["open_time"].iloc[-60],df["open_time"].iloc[-1]]
-        fig.add_trace(go.Scatter(x=xs,y=[predict_line(s_h,i_h,0),predict_line(s_h,i_h,59)],mode="lines",line=dict(color="blue",dash="dash"),name="Trend High"))
-        fig.add_trace(go.Scatter(x=xs,y=[predict_line(s_l,i_l,0),predict_line(s_l,i_l,59)],mode="lines",line=dict(color="orange",dash="dash"),name="Trend Low"))
-    except: pass
-    st.plotly_chart(fig,use_container_width=True)
+
+selected_symbol = st.selectbox("Select symbol", symbols)
+df_chart = get_ohlcv(selected_symbol, timeframe=interval, limit=200)
+
+if df_chart is not None and not df_chart.empty:
+    import plotly.graph_objects as go
+
+    fig = go.Figure(
+        data=[
+            go.Candlestick(
+                x=df_chart["time"],
+                open=df_chart["open"],
+                high=df_chart["high"],
+                low=df_chart["low"],
+                close=df_chart["close"],
+                name=selected_symbol,
+            )
+        ]
+    )
+    fig.update_layout(
+        title=f"{selected_symbol} {interval} Chart",
+        xaxis_title="Time",
+        yaxis_title="Price (USDT)",
+        template="plotly_dark",
+        autosize=True,
+        height=600,
+    )
+    st.plotly_chart(fig, use_container_width=True)
 else:
-    st.error("Cannot fetch data for "+sel)
+    st.error(f"❌ Cannot fetch data for {selected_symbol}")
+
+# ==============================
+# Scan / Actions
+# ==============================
+st.markdown("---")
+st.subheader("Scan / Actions")
+
+if st.button("Manual Scan now"):
+    st.success("✅ Scan complete (placeholder logic).")
