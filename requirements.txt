@@ -1,6 +1,5 @@
-streamlit>=1.20
-pandas
-numpy
+flask
 requests
-plotly
-urllib3
+numpy
+pandas
+matplotlib
