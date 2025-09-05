@@ -1,5 +1,6 @@
-streamlit
-requests
+streamlit>=1.20
 pandas
 numpy
+requests
 plotly
+urllib3
