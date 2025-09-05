@@ -1,93 +1,135 @@
-import os
 import requests
-import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use('Agg')  # để render chart không cần GUI
-import matplotlib.pyplot as plt
-from flask import Flask, render_template, request, jsonify, send_file
-from io import BytesIO
-from datetime import datetime
+import numpy as np
+import datetime
+import time
+import streamlit as st
+import plotly.graph_objects as go
 
-app = Flask(__name__)
+# ============ CONFIG ============
+BASE_URL = "https://api.binance.com"
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "ADAUSDT", "SOLUSDT"]  # Top coin
+INTERVAL = "15m"
+LIMIT = 200
+STOP_LOSS_PCT = 0.05
+TAKE_PROFIT_PCT = 0.10
 
-BINANCE_API = "https://api.binance.com/api/v3/klines"
+# Giả lập danh sách lệnh
+open_trades = []
+closed_trades = []
 
-# ====== Lấy dữ liệu giá từ Binance ======
-def get_klines(symbol="BTCUSDT", interval="1h", limit=200):
-    url = f"{BINANCE_API}?symbol={symbol}&interval={interval}&limit={limit}"
-    res = requests.get(url)
-    data = res.json()
+# ============ API ===============
+def get_klines(symbol, interval=INTERVAL, limit=LIMIT):
+    url = f"{BASE_URL}/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    r = requests.get(url, params=params)
+    data = r.json()
     df = pd.DataFrame(data, columns=[
-        "timestamp","open","high","low","close","volume",
-        "close_time","quote_asset_volume","num_trades",
+        "time","open","high","low","close","volume","close_time","qav","num_trades",
         "taker_base_vol","taker_quote_vol","ignore"
     ])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df["time"] = pd.to_datetime(df["time"], unit="ms")
     df[["open","high","low","close","volume"]] = df[["open","high","low","close","volume"]].astype(float)
     return df
 
-# ====== Vẽ chart với trendline ======
-def plot_chart(df, symbol):
-    fig, ax = plt.subplots(figsize=(10,5))
-    ax.plot(df["timestamp"], df["close"], label="Close Price", color="blue")
+def get_price(symbol):
+    url = f"{BASE_URL}/api/v3/ticker/price"
+    params = {"symbol": symbol}
+    r = requests.get(url, params=params).json()
+    return float(r["price"])
 
-    # trendline cơ bản: nối 2 đáy gần nhất và 2 đỉnh gần nhất
-    lows = df.nsmallest(2, "close")
-    highs = df.nlargest(2, "close")
-    ax.plot(lows["timestamp"], lows["close"], color="green", linestyle="--", label="Support Trendline")
-    ax.plot(highs["timestamp"], highs["close"], color="red", linestyle="--", label="Resistance Trendline")
+# ============ ANALYSIS ==========
+def detect_trend_break(df):
+    """
+    Rất đơn giản: nếu close vượt MA20 => tín hiệu LONG
+    Nếu close dưới MA20 => tín hiệu SHORT
+    """
+    df["MA20"] = df["close"].rolling(20).mean()
+    last_close = df["close"].iloc[-1]
+    last_ma = df["MA20"].iloc[-1]
 
-    ax.set_title(f"{symbol} Trendline Chart")
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Price (USDT)")
-    ax.legend()
-
-    buf = BytesIO()
-    plt.savefig(buf, format="png")
-    buf.seek(0)
-    plt.close(fig)
-    return buf
-
-# ====== Đánh giá cơ bản: Long hay Short ======
-def evaluate_signal(df):
-    recent = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    # logic đơn giản: nếu close > open (nến xanh) và trên trendline → Long
-    if recent["close"] > prev["close"]:
+    if last_close > last_ma:
         return "LONG"
-    elif recent["close"] < prev["close"]:
+    elif last_close < last_ma:
         return "SHORT"
     else:
-        return "NEUTRAL"
+        return None
 
-@app.route("/")
-def index():
-    return render_template("index.html")
-
-@app.route("/market")
-def market():
-    symbol = request.args.get("symbol", "BTCUSDT")
-    interval = request.args.get("interval", "1h")
-    df = get_klines(symbol, interval)
-    signal = evaluate_signal(df)
-    price = df.iloc[-1]["close"]
-    return jsonify({
+def simulate_trade(symbol, signal, price):
+    global open_trades, closed_trades
+    trade = {
         "symbol": symbol,
-        "interval": interval,
-        "latest_price": price,
         "signal": signal,
-        "last_update": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    })
+        "entry": price,
+        "tp": price * (1 + TAKE_PROFIT_PCT if signal == "LONG" else 1 - TAKE_PROFIT_PCT),
+        "sl": price * (1 - STOP_LOSS_PCT if signal == "LONG" else 1 + STOP_LOSS_PCT),
+        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "status": "OPEN"
+    }
+    open_trades.append(trade)
+    return trade
 
-@app.route("/chart")
-def chart():
-    symbol = request.args.get("symbol", "BTCUSDT")
-    interval = request.args.get("interval", "1h")
-    df = get_klines(symbol, interval)
-    buf = plot_chart(df, symbol)
-    return send_file(buf, mimetype="image/png")
+def update_trades():
+    global open_trades, closed_trades
+    updated = []
+    for trade in open_trades:
+        price = get_price(trade["symbol"])
+        if trade["signal"] == "LONG":
+            if price >= trade["tp"]:
+                trade["status"] = "TP"
+                trade["exit"] = price
+                closed_trades.append(trade)
+            elif price <= trade["sl"]:
+                trade["status"] = "SL"
+                trade["exit"] = price
+                closed_trades.append(trade)
+            else:
+                updated.append(trade)
+        elif trade["signal"] == "SHORT":
+            if price <= trade["tp"]:
+                trade["status"] = "TP"
+                trade["exit"] = price
+                closed_trades.append(trade)
+            elif price >= trade["sl"]:
+                trade["status"] = "SL"
+                trade["exit"] = price
+                closed_trades.append(trade)
+            else:
+                updated.append(trade)
+    open_trades = updated
 
-if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+# ============ STREAMLIT =========
+st.set_page_config(layout="wide")
+st.title("📈 AI Crypto Trader (Binance Realtime)")
+
+# Market Watch
+cols = st.columns(len(SYMBOLS))
+for i, sym in enumerate(SYMBOLS):
+    price = get_price(sym)
+    cols[i].metric(sym, f"{price:,.2f} USDT")
+
+# Chart + Signal
+selected = st.selectbox("Chọn coin để xem chart:", SYMBOLS)
+df = get_klines(selected, INTERVAL, LIMIT)
+signal = detect_trend_break(df)
+
+fig = go.Figure()
+fig.add_trace(go.Candlestick(
+    x=df["time"], open=df["open"], high=df["high"], low=df["low"], close=df["close"],
+    name="Price"
+))
+fig.add_trace(go.Scatter(x=df["time"], y=df["MA20"], mode="lines", name="MA20"))
+st.plotly_chart(fig, use_container_width=True)
+
+if signal:
+    st.success(f"Tín hiệu hiện tại: {signal}")
+    if st.button(f"Vào lệnh {signal} {selected}"):
+        trade = simulate_trade(selected, signal, df["close"].iloc[-1])
+        st.write("✅ Đã vào lệnh:", trade)
+
+# Cập nhật trạng thái lệnh
+update_trades()
+st.subheader("Lệnh đang mở")
+st.dataframe(pd.DataFrame(open_trades))
+st.subheader("Lệnh đã đóng")
+st.dataframe(pd.DataFrame(closed_trades))
