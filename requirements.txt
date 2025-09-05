@@ -1,5 +1,5 @@
-flask
+streamlit
 requests
-numpy
 pandas
-matplotlib
+numpy
+plotly
