@@ -1,57 +1,50 @@
 # app.py
 """
-AI Crypto Trading — Robust Streamlit app using Binance public REST (data-api) for paper-trade.
+AI Crypto Trading — Robust Streamlit App (Paper-trade)
 Features:
-- Market watch (many symbols)
-- Auto-scan with robust requests (retry/backoff + fallback endpoint)
-- Signal engine: RSI / MA crossover / Pivot+Fibonacci breakout+retest + Volume filter
-- Signal scoring, suggestions, auto paper-execute (create paper orders)
-- Paper order manager with auto TP/SL, CSV export
-- Optional Telegram notifications (configure via st.secrets)
-- Safe: NO live trading (disabled by default)
+ - Binance REST via data-api mirror + retry/backoff
+ - Pivot detection (configurable), Fibonacci retrace + multi-TP scaling
+ - Volume filter, MA crossover, RSI, RSI divergence basic detection
+ - Signal scoring + suggestions
+ - Paper orders saved to SQLite (persistence)
+ - Telegram notifications (configurable via Streamlit secrets or env)
+ - Docker/systemd friendly
+ - Safe: NO live trading; paper-execute only
 """
 import streamlit as st
-import requests
+import requests, json, sqlite3, os, math, logging, time
+import pandas as pd, numpy as np
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-from datetime import datetime
-import time
-import io
-import math
-import logging
+from pathlib import Path
 
-# ------------- CONFIG -------------
-# Use Binance data-api (mirror) which is more cloud-friendly
+# ------------- SETTINGS -------------
+APP_DB = os.environ.get("AICRYPTO_DB_PATH", "aicrypto.db")
 BINANCE_ENDPOINTS = [
-    "https://data-api.binance.vision/api/v3",  # mirror endpoint
-    "https://api.binance.com/api/v3"           # fallback
+    "https://data-api.binance.vision/api/v3",
+    "https://api.binance.com/api/v3"
 ]
-
 DEFAULT_SYMBOLS = "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,ADAUSDT,DOTUSDT,AVAXUSDT,NEARUSDT,SEIUSDT"
 DEFAULT_INTERVAL = "4h"
-AUTO_SCAN_DEFAULT = 900  # seconds
+AUTO_SCAN_DEFAULT = 900
+LOG_LEVEL = logging.INFO
 
 # ------------- Logging -------------
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("aicrypto")
 
-# ------------- HTTP session with retries -------------
-def make_session(total_retries=4, backoff_factor=0.8, status_forcelist=(429,500,502,503,504)):
+# ------------- HTTP session w retry -------------
+def make_session(total_retries=4, backoff=0.6):
     s = requests.Session()
-    retries = Retry(total=total_retries, backoff_factor=backoff_factor, status_forcelist=list(status_forcelist))
-    adapter = HTTPAdapter(max_retries=retries)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
+    r = Retry(total_retries, backoff_factor=backoff, status_forcelist=[429,500,502,503,504], allowed_methods=["GET","POST"])
+    s.mount("https://", HTTPAdapter(max_retries=r))
+    s.mount("http://", HTTPAdapter(max_retries=r))
     return s
-
 SESSION = make_session()
 
-# ------------- Helpers: Binance REST with fallback -------------
 def bn_get(path, params=None, timeout=10):
-    """GET with fallback over BINANCE_ENDPOINTS"""
     last_err = None
     for base in BINANCE_ENDPOINTS:
         url = f"{base.rstrip('/')}/{path.lstrip('/')}"
@@ -61,156 +54,146 @@ def bn_get(path, params=None, timeout=10):
             return r.json()
         except Exception as e:
             last_err = e
-            logger.debug(f"bn_get failed for {url} -> {e}")
+            logger.debug("bn_get fail %s -> %s", url, e)
             time.sleep(0.2)
-    logger.error(f"bn_get all endpoints failed: {last_err}")
+    logger.error("bn_get all fail: %s", last_err)
     return None
 
+# ------------- Data helpers -------------
 def get_price(symbol):
     res = bn_get("ticker/price", params={"symbol": symbol})
-    if res and "price" in res:
-        try:
-            return float(res["price"])
-        except:
-            return None
-    return None
+    if not res: return None
+    try:
+        return float(res.get("price"))
+    except:
+        return None
 
-def get_klines(symbol, interval="4h", limit=500):
+def get_klines(symbol, interval=DEFAULT_INTERVAL, limit=500):
     res = bn_get("klines", params={"symbol": symbol, "interval": interval, "limit": limit})
     if not res:
         return None
-    # columns per Binance API
-    df = pd.DataFrame(res, columns=[
-        "open_time","open","high","low","close","volume",
-        "close_time","quote_asset_volume","num_trades",
-        "taker_buy_base","taker_buy_quote","ignore"
-    ])
+    df = pd.DataFrame(res, columns=["open_time","open","high","low","close","volume","close_time","qav","num_trades","tb1","tb2","ignore"])
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
     for c in ["open","high","low","close","volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
-# ------------- Indicators & analysis helpers -------------
+# ------------- Indicators & analysis -------------
 def add_indicators(df):
     df = df.copy()
     df["MA20"] = df["close"].rolling(20).mean()
     df["MA50"] = df["close"].rolling(50).mean()
     delta = df["close"].diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    avg_up = up.rolling(14).mean()
-    avg_down = down.rolling(14).mean()
+    up = delta.clip(lower=0); down = -delta.clip(upper=0)
+    avg_up = up.rolling(14).mean(); avg_down = down.rolling(14).mean()
     rs = avg_up / avg_down.replace(0, np.nan)
     df["RSI"] = 100 - 100/(1+rs)
     df["vol_ma20"] = df["volume"].rolling(20).mean()
     return df
 
-def find_pivots(df, left=3, right=3):
-    """Return list of (idx, 'H'/'L', price)"""
+def find_pivots(df, left=4, right=4):
+    # stronger pivot detection (configurable left/right)
     pivots = []
     n = len(df)
     for i in range(left, n-right):
-        is_high = True
-        is_low = True
+        is_high = True; is_low = True
         for j in range(1, left+1):
-            if not (df['high'].iloc[i] > df['high'].iloc[i-j]): is_high=False
-            if not (df['high'].iloc[i] > df['high'].iloc[i+j]): is_high=False
-            if not (df['low'].iloc[i] < df['low'].iloc[i-j]): is_low=False
-            if not (df['low'].iloc[i] < df['low'].iloc[i+j]): is_low=False
+            if df['high'].iloc[i] <= df['high'].iloc[i-j]: is_high = False
+            if df['high'].iloc[i] <= df['high'].iloc[i+j]: is_high = False
+            if df['low'].iloc[i] >= df['low'].iloc[i-j]: is_low = False
+            if df['low'].iloc[i] >= df['low'].iloc[i+j]: is_low = False
         if is_high: pivots.append((i,'H',df['high'].iloc[i]))
         if is_low: pivots.append((i,'L',df['low'].iloc[i]))
     return pivots
 
 def fib_levels(low, high):
     diff = high - low
-    return {
-        "0%": high,
-        "23.6%": high - 0.236*diff,
-        "38.2%": high - 0.382*diff,
-        "50%": high - 0.5*diff,
-        "61.8%": high - 0.618*diff,
-        "100%": low
-    }
+    return {"0%":high, "23.6%":high-0.236*diff, "38.2%":high-0.382*diff, "50%":high-0.5*diff, "61.8%":high-0.618*diff, "100%":low}
 
-def slope_of_last(series, window=60):
-    s = series.tail(window)
-    if len(s) < 2: return 0.0
-    x = np.arange(len(s))
-    m, b = np.polyfit(x, s.values, 1)
+def slope(series):
+    x = np.arange(len(series))
+    if len(x) < 2: return 0.0
+    m,b = np.polyfit(x, series.values, 1)
     return float(m)
 
-# ------------- Session state init -------------
-if "orders" not in st.session_state:
-    st.session_state.orders = []  # list of dicts
-if "scan_results" not in st.session_state:
-    st.session_state.scan_results = []
-if "last_scan_at" not in st.session_state:
-    st.session_state.last_scan_at = 0
-if "auto_execute" not in st.session_state:
-    st.session_state.auto_execute = False
-if "telegram_enabled" not in st.session_state:
-    st.session_state.telegram_enabled = False
+def detect_rsi_divergence(df, lookback=40):
+    # basic detection: compare last two price highs/lows vs RSI
+    # returns 'bullish','bearish',None
+    if len(df) < lookback: return None
+    seg = df.tail(lookback)
+    highs = seg['high']; lows = seg['low']; rsi = seg['RSI']
+    # find top 2 highs
+    idxs_high = highs.nlargest(4).index.tolist()
+    if len(idxs_high) >= 2:
+        i1, i2 = sorted(idxs_high[:2])
+        if highs.loc[i1] < highs.loc[i2] and rsi.loc[i1] > rsi.loc[i2]:
+            return 'bearish_div'
+    idxs_low = lows.nsmallest(4).index.tolist()
+    if len(idxs_low) >= 2:
+        i1,i2 = sorted(idxs_low[:2])
+        if lows.loc[i1] > lows.loc[i2] and rsi.loc[i1] < rsi.loc[i2]:
+            return 'bullish_div'
+    return None
 
-# ------------- Streamlit UI -------------
-st.set_page_config(page_title="AI Crypto Trading (Robust)", layout="wide")
-st.title("AI Crypto Trading — Robust Paper-trade (Binance REST)")
+# ------------- Persistence (SQLite) -------------
+def init_db(path=APP_DB):
+    conn = sqlite3.connect(path, check_same_thread=False)
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT,
+        symbol TEXT,
+        side TEXT,
+        entry REAL,
+        sl REAL,
+        tp REAL,
+        size REAL,
+        status TEXT,
+        closed_at TEXT,
+        current_price REAL,
+        pnl_pct REAL,
+        notes TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS logs (ts TEXT, level TEXT, msg TEXT)""")
+    conn.commit()
+    return conn
+DB = init_db(APP_DB)
 
-# Sidebar controls
-st.sidebar.header("Settings")
-symbols_text = st.sidebar.text_area("Symbols (comma separated)", DEFAULT_SYMBOLS, height=160)
-symbols = [s.strip().upper() for s in symbols_text.split(",") if s.strip()]
-chart_interval = st.sidebar.selectbox("Chart interval (detail)", ["15m","1h","4h","1d"], index=2)
-auto_scan = st.sidebar.checkbox("Auto-scan", value=True)
-scan_interval = st.sidebar.number_input("Auto-scan interval (sec)", min_value=30, value=AUTO_SCAN_DEFAULT, step=30)
-score_threshold = st.sidebar.number_input("Signal score threshold (1-10)", min_value=1, max_value=10, value=4)
-volume_factor = st.sidebar.number_input("Volume multiplier (breakout filter)", min_value=1.0, value=1.5, step=0.1)
-sl_max_pct = st.sidebar.number_input("SL max %", min_value=0.5, value=5.0, step=0.5)
-tp_min_pct = st.sidebar.number_input("TP min %", min_value=1.0, value=10.0, step=1.0)
-st.sidebar.markdown("---")
+def db_insert_order(order):
+    c = DB.cursor()
+    c.execute("INSERT INTO orders (created_at,symbol,side,entry,sl,tp,size,status,closed_at,current_price,pnl_pct,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+              (order["created_at"],order["symbol"],order["side"],order["entry"],order["sl"],order["tp"],order["size"],order["status"],order.get("closed_at"),order.get("current_price",0),order.get("pnl_pct",0),order.get("notes","")))
+    DB.commit()
+    return c.lastrowid
 
-# Telegram (optional)
-st.sidebar.subheader("Telegram notify (optional)")
-tg_token = st.secrets.get("telegram_bot_token") if "telegram_bot_token" in st.secrets else st.sidebar.text_input("Bot token (or save in Secrets)", value="")
-tg_chat = st.secrets.get("telegram_chat_id") if "telegram_chat_id" in st.secrets else st.sidebar.text_input("Chat ID (or save in Secrets)", value="")
-if tg_token and tg_chat:
-    st.session_state.telegram_enabled = True
-else:
-    st.session_state.telegram_enabled = False
+def db_update_order_status(order_id, status, closed_at=None):
+    c = DB.cursor()
+    c.execute("UPDATE orders SET status=?, closed_at=? WHERE id=?", (status, closed_at, order_id))
+    DB.commit()
 
-# Execution mode toggles
-st.sidebar.markdown("---")
-st.sidebar.subheader("Execution mode")
-auto_exec_checkbox = st.sidebar.checkbox("Auto-execute suggestions (paper-trade)", value=False)
-st.session_state.auto_execute = auto_exec_checkbox
-st.sidebar.markdown("LIVE trading is disabled in this app for safety. To enable real orders you must implement secure backend and not store API keys in public cloud.")
+def db_list_orders():
+    return pd.read_sql_query("SELECT * FROM orders ORDER BY id DESC", DB)
 
-# Time display
-st.sidebar.text("System UTC: " + datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+def db_log(level, msg):
+    c = DB.cursor()
+    c.execute("INSERT INTO logs (ts,level,msg) VALUES (?,?,?)", (datetime.utcnow().isoformat(),level,msg))
+    DB.commit()
 
-# Top area: market watch
-st.subheader("Market Watch")
-cols = st.columns([3,1])
-with cols[0]:
-    # fetch prices
-    price_rows = []
-    for s in symbols:
-        try:
-            p = get_price(s)
-            price_rows.append({"symbol": s, "price": round(p,8) if p else "err"})
-        except Exception:
-            price_rows.append({"symbol": s, "price": "err"})
-    st.table(pd.DataFrame(price_rows))
+# ------------- Telegram notify -------------
+def tg_notify(token, chat_id, text):
+    try:
+        SESSION.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id":chat_id,"text":text}, timeout=5)
+    except Exception as e:
+        logger.warning("tg_notify failed: %s", e)
 
-with cols[1]:
-    if st.button("Manual scan now"):
-        st.session_state.scan_results = []
-        st.session_state.last_scan_at = 0  # force scan immediately in next block
-        st.experimental_rerun()
-
-# ------------- Signal scanner -------------
-def signal_engine_for_symbol(symbol, interval=chart_interval):
-    """Return suggestion dict or None"""
-    df = get_klines(symbol, interval=interval, limit=500)
+# ------------- Signal engine -------------
+def signal_for_symbol(symbol, interval="4h", config=None):
+    """
+    Returns suggestion dict or None.
+    config: dict {score_threshold, volume_factor, sl_max_pct, tp_min_pct}
+    """
+    cfg = config or {}
+    df = get_klines(symbol, interval=interval, limit=700)
     if df is None or df.empty:
         return None
     df = add_indicators(df)
@@ -218,235 +201,241 @@ def signal_engine_for_symbol(symbol, interval=chart_interval):
     price_now = get_price(symbol) or float(last["close"])
     score = 0
     notes = []
-    # RSI extremes
-    rsi = float(last.get("RSI") if not pd.isna(last.get("RSI")) else np.nan)
+    # RSI
+    rsi = last.get("RSI", np.nan)
     if not math.isnan(rsi):
-        if rsi < 28:
-            score += 2; notes.append("RSI <28 (oversold)")
-        elif rsi > 72:
-            score += 2; notes.append("RSI >72 (overbought)")
-    # MA crossover
-    if "MA20" in df.columns and "MA50" in df.columns and not pd.isna(df["MA20"].iloc[-2]):
-        prev_ma20, prev_ma50 = df["MA20"].iloc[-2], df["MA50"].iloc[-2]
-        cur_ma20, cur_ma50 = df["MA20"].iloc[-1], df["MA50"].iloc[-1]
-        if prev_ma20 < prev_ma50 and cur_ma20 > cur_ma50:
-            score += 2; notes.append("MA20>MA50 crossover")
-            ma_signal = "LONG"
-        elif prev_ma20 > prev_ma50 and cur_ma20 < cur_ma50:
-            score += 2; notes.append("MA20<MA50 crossover")
-            ma_signal = "SHORT"
+        if rsi < 30:
+            score += 2; notes.append("RSI low")
+        elif rsi > 70:
+            score += 2; notes.append("RSI high")
+    # MA cross
+    if "MA20" in df.columns and "MA50" in df.columns and not math.isnan(df["MA20"].iloc[-2]):
+        prev20, prev50 = df["MA20"].iloc[-2], df["MA50"].iloc[-2]
+        cur20, cur50 = df["MA20"].iloc[-1], df["MA50"].iloc[-1]
+        if prev20 < prev50 and cur20 > cur50:
+            score += 2; notes.append("MA cross up")
+            ma_sig = "LONG"
+        elif prev20 > prev50 and cur20 < cur50:
+            score += 2; notes.append("MA cross down")
+            ma_sig = "SHORT"
         else:
-            ma_signal = None
+            ma_sig = None
     else:
-        ma_signal = None
-    # pivot/fib & breakout
-    pivots = find_pivots(df, left=3, right=3)
-    # compute recent high/low
-    recent_high = df["high"].iloc[-21:-1].max()
-    recent_low = df["low"].iloc[-21:-1].min()
-    breakout = last["close"] > recent_high
-    breakdown = last["close"] < recent_low
-    vol = float(last["volume"])
-    vol_ma = float(last.get("vol_ma20") if not pd.isna(last.get("vol_ma20")) else np.nan)
-    vol_ok = False
-    if not math.isnan(vol_ma) and vol_ma > 0 and vol > vol_ma * volume_factor:
-        vol_ok = True
-        score += 1; notes.append("Volume spike")
-    # breakout scoring
-    if breakout:
-        if vol_ok:
-            score += 2; notes.append("Breakout above recent high with vol")
-        else:
-            score += 1; notes.append("Breakout above recent high (low vol)")
-        breakout_signal = "LONG"
-    elif breakdown:
-        if vol_ok:
-            score += 2; notes.append("Breakdown below recent low with vol")
-        else:
-            score += 1; notes.append("Breakdown below recent low (low vol)")
-        breakout_signal = "SHORT"
-    else:
-        breakout_signal = None
-    # fib retest if swing found
-    # find last low/high pair
-    swings = {"L":[], "H":[]}
-    for idx, t, price in pivots:
-        swings[t].append((idx, price))
-    if swings["L"] and swings["H"]:
-        last_low_idx, last_low_price = swings["L"][-1]
-        last_high_idx, last_high_price = swings["H"][-1]
-        if last_low_idx < last_high_idx:
-            lowp, highp = last_low_price, last_high_price
-        else:
-            lowp, highp = last_high_price, last_low_price
+        ma_sig = None
+    # pivot/fib
+    pivs = find_pivots(df, left=4, right=4)
+    lows = [p for p in pivs if p[1]=='L']; highs = [p for p in pivs if p[1]=='H']
+    fib_note = None
+    if lows and highs:
+        last_low = lows[-1][2]; last_high = highs[-1][2]
+        lowp, highp = (last_low, last_high) if last_low < last_high else (last_high, last_low)
         if lowp < highp:
             fibs = fib_levels(lowp, highp)
-            # if close near key fib levels
+            # check retest near fibs
             for key in ("38.2%","50%","61.8%"):
                 lvl = fibs[key]
-                if abs(price_now - lvl)/lvl < 0.01:
-                    score += 1; notes.append(f"Retest fib {key}")
-    # slope trend
-    slope = slope_of_last(df["close"].tail(120), window=60) if len(df)>=60 else slope_of_last(df["close"])
-    if slope > 0:
-        notes.append("Trend slope +")
-    elif slope < 0:
-        notes.append("Trend slope -")
-    # decide final action
+                if abs(price_now - lvl)/lvl < 0.012:  # 1.2% tolerance
+                    score += 1; notes.append(f"Retest {key}")
+                    fib_note = key
+    # recent breakout
+    recent_high = df["high"].iloc[-21:-1].max()
+    recent_low = df["low"].iloc[-21:-1].min()
+    breakout = price_now > recent_high
+    breakdown = price_now < recent_low
+    vol = last["volume"]; vol_ma = last.get("vol_ma20", np.nan)
+    vol_ok = False
+    if not math.isnan(vol_ma) and vol > vol_ma * cfg.get("volume_factor",1.5):
+        vol_ok = True; score += 1; notes.append("Vol spike")
+    if breakout:
+        score += 2 if vol_ok else 1
+        notes.append("Breakout")
+        break_sig = "LONG"
+    elif breakdown:
+        score += 2 if vol_ok else 1
+        notes.append("Breakdown")
+        break_sig = "SHORT"
+    else:
+        break_sig = None
+    # RSI divergence detection
+    div = detect_rsi_divergence(df, lookback=80)
+    if div == 'bullish_div':
+        score += 1; notes.append("Bullish RSI div")
+    elif div == 'bearish_div':
+        score += 1; notes.append("Bearish RSI div")
+    # slope
+    slp = slope(df["close"].tail(120))
+    if slp > 0: notes.append("Up slope")
+    if slp < 0: notes.append("Down slope")
+    # final action decision
     action = None
-    # combine MA and breakout: require either breakout or MA crossover plus score threshold
-    if score >= score_threshold:
-        # prefer breakout if present
-        if breakout_signal:
-            action = breakout_signal
-        elif ma_signal:
-            action = ma_signal
+    threshold = cfg.get("score_threshold", 4)
+    if score >= threshold:
+        # precedence: breakout > MA > RSI diverge
+        if break_sig:
+            action = break_sig
+        elif ma_sig:
+            action = ma_sig
         else:
-            # fallback: if RSI strong extreme:
-            if rsi < 28:
-                action = "LONG"
-            elif rsi > 72:
-                action = "SHORT"
-    # prepare SL/TP conservative
+            # fallback on RSI extremes
+            if rsi < 30: action = "LONG"
+            elif rsi > 70: action = "SHORT"
     if action:
         entry = price_now
+        sl_pct = min(0.03, cfg.get("sl_max_pct",5.0)/100.0)
+        tp_pct = max(cfg.get("tp_min_pct",10.0)/100.0, 0.10)
         if action == "LONG":
-            sl = round(entry * (1 - min(0.03, sl_max_pct/100.0)), 8)
-            tp = round(entry * (1 + max(tp_min_pct/100.0, 0.10)), 8)
+            sl = round(entry * (1 - sl_pct),8)
+            tp1 = round(entry * (1 + tp_pct),8)
+            # multi-target scaling: TP1, TP2 (fib extension idea)
+            tp2 = round(entry * (1 + tp_pct*1.8),8)
+            tp3 = round(entry * (1 + tp_pct*3.0),8)
         else:
-            sl = round(entry * (1 + min(0.03, sl_max_pct/100.0)), 8)
-            tp = round(entry * (1 - max(tp_min_pct/100.0, 0.10)), 8)
+            sl = round(entry * (1 + sl_pct),8)
+            tp1 = round(entry * (1 - tp_pct),8)
+            tp2 = round(entry * (1 - tp_pct*1.8),8)
+            tp3 = round(entry * (1 - tp_pct*3.0),8)
         rr = None
         try:
-            if action == "LONG":
-                rr = round((tp - entry) / max(entry - sl, 1e-9), 2)
-            else:
-                rr = round((entry - tp) / max(sl - entry, 1e-9), 2)
+            if action == "LONG": rr = round((tp1-entry)/max(entry-sl,1e-9),2)
+            else: rr = round((entry-tp1)/max(sl-entry,1e-9),2)
         except:
             rr = None
         return {
-            "symbol": symbol,
-            "action": action,
-            "price": round(entry,8),
-            "sl": sl,
-            "tp": tp,
-            "score": score,
-            "rr": rr,
-            "notes": "; ".join(notes)
+            "symbol": symbol, "action": action, "price": round(entry,8),
+            "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+            "score": score, "rr": rr, "notes": "; ".join(notes), "fib_note": fib_note
         }
     return None
 
-# ------------- Scanning orchestration -------------
-def run_scan_all():
-    results = []
+# ------------- Session state -------------
+if "last_scan" not in st.session_state: st.session_state.last_scan = 0
+if "scan_results" not in st.session_state: st.session_state.scan_results = []
+if "orders_cached" not in st.session_state: st.session_state.orders_cached = []
+
+# ------------- UI -------------
+st.set_page_config(page_title="AI Crypto Trading (Pro)", layout="wide")
+st.title("AI Crypto Trading — Enhanced (Paper)")
+
+# Sidebar
+st.sidebar.header("Settings & Controls")
+symbols = st.sidebar.text_area("Symbols (comma separated)", DEFAULT_SYMBOLS, height=150)
+symbols = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+interval = st.sidebar.selectbox("Detail interval", ["15m","1h","4h","1d"], index=2)
+auto_scan = st.sidebar.checkbox("Auto-scan", value=True)
+scan_interval = st.sidebar.number_input("Auto-scan interval (sec)", min_value=30, value= AUTO_SCAN_DEFAULT, step=30)
+score_threshold = st.sidebar.number_input("Score threshold", min_value=1, max_value=10, value=4)
+volume_factor = st.sidebar.number_input("Volume factor", min_value=1.0, value=1.5)
+sl_max_pct = st.sidebar.number_input("SL max %", min_value=0.5, value=5.0)
+tp_min_pct = st.sidebar.number_input("TP min %", min_value=1.0, value=10.0)
+
+# Telegram secrets (read from Streamlit secrets or env)
+tg_token = st.secrets.get("telegram_bot_token") if "telegram_bot_token" in st.secrets else os.environ.get("TG_BOT_TOKEN","")
+tg_chat = st.secrets.get("telegram_chat_id") if "telegram_chat_id" in st.secrets else os.environ.get("TG_CHAT_ID","")
+if tg_token and tg_chat:
+    tg_enabled = True
+else:
+    tg_enabled = False
+
+auto_exec = st.sidebar.checkbox("Auto-execute suggestions (paper)", value=False)
+st.sidebar.info("Paper-trade only. For live trading implement secure backend & never store API keys in plaintext on public hosting.")
+
+# Top area: Market watch + quick scan
+st.subheader("Market Watch")
+col1, col2 = st.columns([2,1])
+with col1:
+    price_rows = []
+    for s in symbols:
+        p = get_price(s)
+        price_rows.append({"symbol": s, "price": round(p,8) if p else "err"})
+    st.table(pd.DataFrame(price_rows))
+with col2:
+    if st.button("Manual scan now"):
+        st.session_state.last_scan = 0
+
+# scan orchestration
+now = time.time()
+if (auto_scan and (now - st.session_state.last_scan > scan_interval)) or st.session_state.last_scan == 0:
+    st.session_state.last_scan = now
+    cfg = {"score_threshold": score_threshold, "volume_factor": volume_factor, "sl_max_pct": sl_max_pct, "tp_min_pct": tp_min_pct}
+    out = []
     for s in symbols:
         try:
-            r = signal_engine_for_symbol(s, interval=chart_interval)
+            r = signal_for_symbol(s, interval=interval, config=cfg)
             if r:
-                results.append(r)
+                out.append(r)
         except Exception as e:
-            logger.exception("scan symbol error: %s %s", s, e)
-    return results
-
-# auto-scan trigger based on interval and on manual button
-if (auto_scan and (time.time() - st.session_state.last_scan_at > scan_interval)) or st.session_state.last_scan_at == 0:
-    st.session_state.last_scan_at = time.time()
-    st.session_state.scan_results = run_scan_all()
-    if st.session_state.scan_results:
-        # auto-execute if enabled
-        if st.session_state.auto_execute:
-            for sug in st.session_state.scan_results:
-                # avoid duplicate open paper orders same symbol & side
-                exists = any(o for o in st.session_state.orders if o["symbol"]==sug["symbol"] and o["side"]==sug["action"] and o["status"]=="OPEN")
-                if exists:
-                    continue
-                order = {
-                    "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                    "symbol": sug["symbol"],
-                    "side": sug["action"],
-                    "entry": float(sug["price"]),
-                    "sl": float(sug["sl"]),
-                    "tp": float(sug["tp"]),
-                    "size": 1.0,
-                    "status": "OPEN",
-                    "closed_at": None,
-                    "current_price": float(sug["price"]),
-                    "pnl_pct": 0.0,
-                    "notes": sug["notes"]
-                }
-                st.session_state.orders.append(order)
-                # notify telegram if enabled
-                if st.session_state.telegram_enabled and tg_token and tg_chat:
-                    try:
-                        txt = f"Paper order created: {order['symbol']} {order['side']} @ {order['entry']} SL {order['sl']} TP {order['tp']}"
-                        SESSION.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", json={"chat_id":tg_chat,"text":txt}, timeout=5)
-                    except Exception as e:
-                        logger.warning("Telegram notify failed: %s", e)
-
-# ------------- Show suggestions -------------
+            logger.exception("scan symbol error %s %s", s, e)
+    st.session_state.scan_results = out
+    # auto-execute as paper orders
+    if auto_exec and out:
+        for sug in out:
+            # prevent duplicates same symbol+side open
+            existing = DB.cursor().execute("SELECT count(*) FROM orders WHERE symbol=? AND side=? AND status='OPEN'", (sug["symbol"], sug["action"])).fetchone()[0]
+            if existing > 0:
+                continue
+            order = {
+                "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                "symbol": sug["symbol"], "side": sug["action"], "entry": sug["price"],
+                "sl": sug["sl"], "tp": sug["tp1"], "size": 1.0, "status": "OPEN",
+                "closed_at": None, "current_price": sug["price"], "pnl_pct": 0.0, "notes": sug["notes"]
+            }
+            db_insert_order(order)
+            if tg_enabled:
+                tg_notify(tg_token, tg_chat, f"[Paper order] {order['symbol']} {order['side']} @ {order['entry']} SL {order['sl']} TP {order['tp']}")
+    # log scan
+    db_log("INFO", f"Scan completed: {len(st.session_state.scan_results)} suggestions")
+# show results
 st.markdown("---")
-st.subheader("Suggestions")
+st.subheader("Suggestions / Signals")
 if st.session_state.scan_results:
-    df_sug = pd.DataFrame(st.session_state.scan_results)
-    st.table(df_sug[["symbol","action","price","sl","tp","score","rr"]])
-    for i, r in enumerate(st.session_state.scan_results):
-        cols = st.columns([3,1])
-        with cols[0]:
-            st.write(f"**{r['symbol']}** → {r['action']} @ {r['price']}  |  score {r['score']}  |  RR {r['rr']}")
-            st.caption(r["notes"])
-        with cols[1]:
-            if st.button(f"Add paper {i}"):
-                exists = any(o for o in st.session_state.orders if o["symbol"]==r["symbol"] and o["side"]==r["action"] and o["status"]=="OPEN")
-                if exists:
+    df_s = pd.DataFrame(st.session_state.scan_results)
+    st.table(df_s[["symbol","action","price","sl","tp1","score","rr"]])
+    for i,r in df_s.iterrows():
+        c1,c2 = st.columns([3,1])
+        with c1:
+            st.write(f"**{r['symbol']}** — {r['action']} @ {r['price']} (score {r['score']})")
+            st.caption(r.get("notes",""))
+        with c2:
+            if st.button(f"Add paper order {i}"):
+                existing = DB.cursor().execute("SELECT count(*) FROM orders WHERE symbol=? AND side=? AND status='OPEN'", (r['symbol'], r['action'])).fetchone()[0]
+                if existing > 0:
                     st.warning("Similar open order exists")
                 else:
-                    st.session_state.orders.append({
+                    order = {
                         "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                        "symbol": r["symbol"],
-                        "side": r["action"],
-                        "entry": float(r["price"]),
-                        "sl": float(r["sl"]),
-                        "tp": float(r["tp"]),
-                        "size": 1.0,
-                        "status": "OPEN",
-                        "closed_at": None,
-                        "current_price": float(r["price"]),
-                        "pnl_pct": 0.0,
-                        "notes": r["notes"]
-                    })
+                        "symbol": r['symbol'], "side": r['action'], "entry": r['price'],
+                        "sl": r['sl'], "tp": r['tp1'], "size": 1.0, "status": "OPEN",
+                        "closed_at": None, "current_price": r['price'], "pnl_pct": 0.0, "notes": r.get("notes","")
+                    }
+                    db_insert_order(order)
                     st.success("Paper order added")
-
 else:
-    st.info("No suggestions found (try manual scan or adjust threshold/volume filter).")
+    st.info("No suggestions now")
 
-# ------------- Chart & analysis -------------
+# Chart & analysis
 st.markdown("---")
-st.subheader("Chart & Analysis")
-chart_sym = st.selectbox("Select symbol", symbols, index=0)
-dfc = get_klines(chart_sym, interval=chart_interval, limit=500)
+st.subheader("Chart & Trendline")
+chart_sym = st.selectbox("Chart symbol", symbols, index=0)
+dfc = get_klines(chart_sym, interval=interval, limit=500)
 if dfc is None:
-    st.error("Cannot fetch chart data for " + chart_sym)
+    st.error("Cannot fetch chart data")
 else:
     dfc = add_indicators(dfc)
     fig = go.Figure(data=[go.Candlestick(x=dfc["open_time"], open=dfc["open"], high=dfc["high"], low=dfc["low"], close=dfc["close"], name=chart_sym)])
-    if "MA20" in dfc.columns:
-        fig.add_trace(go.Scatter(x=dfc["open_time"], y=dfc["MA20"], name="MA20"))
-    if "MA50" in dfc.columns:
-        fig.add_trace(go.Scatter(x=dfc["open_time"], y=dfc["MA50"], name="MA50"))
-    pivs = find_pivots(dfc, left=3, right=3)
-    for p in pivs[-40:]:
-        idx, t, price = p
+    if "MA20" in dfc.columns: fig.add_trace(go.Scatter(x=dfc["open_time"], y=dfc["MA20"], name="MA20"))
+    if "MA50" in dfc.columns: fig.add_trace(go.Scatter(x=dfc["open_time"], y=dfc["MA50"], name="MA50"))
+    pivs = find_pivots(dfc, left=4, right=4)
+    for p in pivs[-50:]:
+        idx, t, px = p
         tm = dfc["open_time"].iloc[idx]
         if t == 'H':
-            fig.add_trace(go.Scatter(x=[tm], y=[price], mode="markers", marker=dict(color="red", size=7), name="PivotH", showlegend=False))
+            fig.add_trace(go.Scatter(x=[tm], y=[px], mode="markers", marker=dict(color="red", size=7), showlegend=False))
         else:
-            fig.add_trace(go.Scatter(x=[tm], y=[price], mode="markers", marker=dict(color="green", size=7), name="PivotL", showlegend=False))
-    # draw last fib if possible
-    lows = [p for p in pivs if p[1]=='L']
-    highs = [p for p in pivs if p[1]=='H']
+            fig.add_trace(go.Scatter(x=[tm], y=[px], mode="markers", marker=dict(color="green", size=7), showlegend=False))
+    # draw fib from last swing if found
+    lows = [p for p in pivs if p[1]=='L']; highs = [p for p in pivs if p[1]=='H']
     if lows and highs:
-        last_low = lows[-1][2]
-        last_high = highs[-1][2]
+        last_low = lows[-1][2]; last_high = highs[-1][2]
         lowp, highp = (last_low, last_high) if last_low < last_high else (last_high, last_low)
         if lowp < highp:
             fibs = fib_levels(lowp, highp)
@@ -455,81 +444,53 @@ else:
     fig.update_layout(height=640, template="plotly_dark")
     st.plotly_chart(fig, use_container_width=True)
 
-# ------------- Paper order manager -------------
+# Paper orders manager
 st.markdown("---")
-st.subheader("Paper Orders (manager)")
-# refresh order prices and auto TP/SL
-def refresh_orders():
-    for i,o in enumerate(st.session_state.orders):
-        if o["status"] == "CLOSED": continue
-        cp = get_price(o["symbol"]) or o.get("current_price", o["entry"])
-        st.session_state.orders[i]["current_price"] = round(cp,8)
-        # PnL %
-        if o["side"] == "LONG":
-            pnl = (cp - o["entry"]) / o["entry"] * 100
-        else:
-            pnl = (o["entry"] - cp) / o["entry"] * 100
-        st.session_state.orders[i]["pnl_pct"] = round(pnl,4)
-        # auto close
-        if o["status"] == "OPEN":
-            if o["side"] == "LONG":
-                if cp >= o["tp"]:
-                    st.session_state.orders[i]["status"] = "CLOSED"
-                    st.session_state.orders[i]["closed_at"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-                    if st.session_state.telegram_enabled and tg_token and tg_chat:
-                        try:
-                            SESSION.post(f"https://api.telegram.org/bot{tg_token}/sendMessage", json={"chat_id":tg_chat,"text":f"TP hit (paper): {o['symbol']} LONG @ {cp}"}, timeout=5)
-                        except: pass
-                elif cp <= o["sl"]:
-                    st.session_state.orders[i]["status"] = "CLOSED"
-                    st.session_state.orders[i]["closed_at"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+st.subheader("Paper Orders")
+orders_df = db_list_orders()
+if not orders_df.empty:
+    st.dataframe(orders_df, use_container_width=True)
+    # refresh prices & auto TP/SL
+    for idx,row in orders_df.iterrows():
+        if row['status'] == 'CLOSED': continue
+        cp = get_price(row['symbol']) or row['current_price']
+        pnl = 0.0
+        if row['side'] == 'LONG': pnl = (cp - row['entry'])/row['entry']*100
+        else: pnl = (row['entry'] - cp)/row['entry']*100
+        # update DB row: (for simplicity we update via SQL)
+        DB.cursor().execute("UPDATE orders SET current_price=?, pnl_pct=? WHERE id=?", (cp, round(pnl,4), row['id']))
+        DB.commit()
+        # auto-close
+        if row['status']=='OPEN':
+            if row['side']=='LONG':
+                if cp >= row['tp']:
+                    DB.cursor().execute("UPDATE orders SET status='CLOSED', closed_at=? WHERE id=?", (datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), row['id']))
+                    DB.commit()
+                    if tg_enabled: tg_notify(tg_token, tg_chat, f"[TP Hit] {row['symbol']} LONG paper @ {cp}")
+                elif cp <= row['sl']:
+                    DB.cursor().execute("UPDATE orders SET status='CLOSED', closed_at=? WHERE id=?", (datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), row['id']))
+                    DB.commit()
+                    if tg_enabled: tg_notify(tg_token, tg_chat, f"[SL Hit] {row['symbol']} LONG paper @ {cp}")
             else:
-                if cp <= o["tp"]:
-                    st.session_state.orders[i]["status"] = "CLOSED"
-                    st.session_state.orders[i]["closed_at"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-                elif cp >= o["sl"]:
-                    st.session_state.orders[i]["status"] = "CLOSED"
-                    st.session_state.orders[i]["closed_at"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
-refresh_orders()
-
-if st.session_state.orders:
-    df_orders = pd.DataFrame(st.session_state.orders)
-    st.dataframe(df_orders[["created_at","symbol","side","entry","current_price","pnl_pct","sl","tp","status","closed_at","notes"]], use_container_width=True)
-    # actions
-    for idx,o in enumerate(list(st.session_state.orders)):
-        c1,c2,c3 = st.columns([3,1,1])
-        c1.write(f"{o['symbol']} | {o['side']} | entry {o['entry']} | status {o['status']}")
-        if c2.button(f"Close {idx}"):
-            st.session_state.orders[idx]["status"] = "CLOSED"
-            st.session_state.orders[idx]["closed_at"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-            st.experimental_rerun()
-        if c3.button(f"Delete {idx}"):
-            st.session_state.orders.pop(idx)
-            st.experimental_rerun()
-    # download CSV
-    csv = pd.DataFrame(st.session_state.orders).to_csv(index=False).encode("utf-8")
-    st.download_button("Download orders CSV", csv, file_name=f"paper_orders_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.csv")
+                if cp <= row['tp']:
+                    DB.cursor().execute("UPDATE orders SET status='CLOSED', closed_at=? WHERE id=?", (datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), row['id']))
+                    DB.commit()
+                    if tg_enabled: tg_notify(tg_token, tg_chat, f"[TP Hit] {row['symbol']} SHORT paper @ {cp}")
+                elif cp >= row['sl']:
+                    DB.cursor().execute("UPDATE orders SET status='CLOSED', closed_at=? WHERE id=?", (datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), row['id']))
+                    DB.commit()
+                    if tg_enabled: tg_notify(tg_token, tg_chat, f"[SL Hit] {row['symbol']} SHORT paper @ {cp}")
+    # refresh view
+    st.experimental_rerun()
 else:
     st.info("No paper orders yet")
 
-# ------------- Reports -------------
+# Reports & export
 st.markdown("---")
-st.subheader("Reports")
-if st.button("Daily closed summary"):
-    closed = [o for o in st.session_state.orders if o["status"]=="CLOSED"]
-    dfc = pd.DataFrame(closed) if closed else pd.DataFrame()
-    total = dfc["pnl_pct"].sum() if not dfc.empty else 0
-    wins = dfc[dfc["pnl_pct"]>0].shape[0] if not dfc.empty else 0
-    losses = dfc[dfc["pnl_pct"]<=0].shape[0] if not dfc.empty else 0
-    st.json({
-        "time_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-        "closed_count": len(closed),
-        "wins": wins, "losses": losses, "total_pnl_pct": round(total,4)
-    })
+st.subheader("Reports & Export")
+if st.button("Export orders CSV"):
+    df = db_list_orders()
+    csv = df.to_csv(index=False).encode('utf-8')
+    st.download_button("Download CSV", csv, file_name=f"paper_orders_{datetime.utcnow().strftime('%Y%m%d')}.csv")
 
-# auto refresh UI (scan interval)
-if auto_scan:
-    st.experimental_autorefresh(interval=scan_interval*1000, key="auto_scan")
-
-st.info("App runs PAPER-trade only by default. For live trading integration you must implement secure backend & API key management (NOT recommended on Streamlit Cloud).")
+st.info("Paper-trade only. For production/live trading: use secure backend, never store real API keys in this UI.")
