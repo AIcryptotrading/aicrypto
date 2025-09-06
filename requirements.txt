@@ -1,6 +1,8 @@
 streamlit
-requests
 pandas
 numpy
-plotly
-python-dateutil
+requests
+matplotlib
+python-binance
+ta-lib
+pyyaml
