@@ -1,10 +1,5 @@
 streamlit
 pandas
-numpy
-matplotlib
-requests
 python-binance
-ta-lib
-PyYAML
-scikit-learn
-tensorflow
+ta
+requests
