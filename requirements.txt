@@ -1,17 +1,13 @@
-streamlit
-pandas
-numpy
+streamlit>=1.20.0
+pandas>=1.5
+numpy>=1.22
+requests>=2.28
+pyyaml
+joblib
+scikit-learn
 matplotlib
 plotly
-requests
+ta
+python-dotenv
 python-binance
-ta-lib
-PyYAML
-scikit-learn
-joblib
-stable-baselines3[extra]    # PPO/DQN (requires torch)
-gym
-torch
-tensorflow>=2.10.0          # optional for LSTM-based supervised model
-transformers                # Hugging Face (optional)
-optuna                      # hyperparam tuning (optional)
+shap  # optional - heavy

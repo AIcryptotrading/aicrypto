@@ -1,0 +1,8 @@
+binance_api_key: ""
+binance_api_secret: ""
+telegram_token: ""
+telegram_chat_id: ""
+default_symbols: ["BTCUSDT","ETHUSDT"]
+data_interval: "4h"
+paper_trade: true
+auto_scan_interval_sec: 900
