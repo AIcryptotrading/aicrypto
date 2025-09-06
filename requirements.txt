@@ -1,5 +1,17 @@
 streamlit
 pandas
-python-binance
-ta
+numpy
+matplotlib
+plotly
 requests
+python-binance
+ta-lib
+PyYAML
+scikit-learn
+joblib
+stable-baselines3[extra]    # PPO/DQN (requires torch)
+gym
+torch
+tensorflow>=2.10.0          # optional for LSTM-based supervised model
+transformers                # Hugging Face (optional)
+optuna                      # hyperparam tuning (optional)
