@@ -1,23 +1,41 @@
+# utils.py
+import requests
 import pandas as pd
-from binance.client import Client
-import ta
+import numpy as np
+import talib
+from datetime import datetime
 
-# Hàm lấy dữ liệu nến
-def get_klines(symbol="BTCUSDT", interval="1h", limit=500):
-    client = Client()
-    klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
-    df = pd.DataFrame(klines, columns=[
-        "timestamp","open","high","low","close","volume",
-        "close_time","qav","num_trades","taker_base","taker_quote","ignore"
+BASE_URL = "https://api.binance.com"
+
+def fetch_klines(symbol: str, interval: str="4h", limit: int=500):
+    url = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    df = pd.DataFrame(data, columns=[
+        "open_time","o","h","l","c","v","close_time","qav","num_trades","tb_base","tb_quote","ignore"
     ])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-    df.set_index("timestamp", inplace=True)
-    df = df.astype(float)
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    for col in ["o","h","l","c","v"]:
+        df[col] = df[col].astype(float)
+    df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"}, inplace=True)
+    df.set_index("open_time", inplace=True)
     return df
 
-# Hàm tính toán indicator
-def compute_indicators(df):
-    df["rsi"] = ta.momentum.RSIIndicator(df["close"], window=14).rsi()
-    df["ema20"] = ta.trend.EMAIndicator(df["close"], window=20).ema_indicator()
-    df["ema50"] = ta.trend.EMAIndicator(df["close"], window=50).ema_indicator()
+def add_indicators(df: pd.DataFrame):
+    close = df["close"].values
+    df["rsi"] = talib.RSI(close, timeperiod=14)
+    df["ema20"] = talib.EMA(close, timeperiod=20)
+    df["ema50"] = talib.EMA(close, timeperiod=50)
+    df["ma200"] = talib.SMA(close, timeperiod=200)
+    # Volatility
+    df["atr"] = talib.ATR(df["high"], df["low"], df["close"], timeperiod=14)
+    # Volume moving average
+    df["vol_ma20"] = pd.Series(df["volume"]).rolling(20).mean()
     return df
+
+def last_price(symbol: str):
+    url = f"{BASE_URL}/api/v3/ticker/price?symbol={symbol}"
+    r = requests.get(url, timeout=5)
+    r.raise_for_status()
+    return float(r.json()["price"])
