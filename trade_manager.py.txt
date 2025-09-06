@@ -1,11 +1,22 @@
-import pandas as pd
+# trade_manager.py
+import time
+from typing import Dict, List
 
-orders = []
+PAPER_ORDERS = []
 
-def place_order(symbol, side, price, size=100):
-    order = {"symbol": symbol, "side": side, "price": price, "size": size}
-    orders.append(order)
+def place_paper_order(symbol: str, side: str, price: float, size: float, note: str=""):
+    order = {
+        "ts": time.time(),
+        "symbol": symbol,
+        "side": side,
+        "price": price,
+        "size": size,
+        "note": note
+    }
+    PAPER_ORDERS.append(order)
     return order
 
-def get_orders():
-    return pd.DataFrame(orders)
+def list_paper_orders():
+    return PAPER_ORDERS
+
+# NOTE: live trading functions should be added separately with secure API handling
