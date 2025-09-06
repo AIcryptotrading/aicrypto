@@ -1,0 +1,11 @@
+import pandas as pd
+
+orders = []
+
+def place_order(symbol, side, price, size=100):
+    order = {"symbol": symbol, "side": side, "price": price, "size": size}
+    orders.append(order)
+    return order
+
+def get_orders():
+    return pd.DataFrame(orders)

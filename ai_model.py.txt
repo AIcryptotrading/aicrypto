@@ -1,0 +1,30 @@
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+import joblib
+import os
+
+MODEL_PATH = "data/ai_model.pkl"
+
+def train_ai_model(df):
+    # feature = RSI, MA50, MA200
+    X = np.column_stack([df["rsi"].fillna(0), df["ma50"].fillna(0), df["ma200"].fillna(0)])
+    # label: 1 nếu giá tăng >2% trong 5 nến tới, ngược lại 0
+    y = (df["c"].shift(-5) > df["c"] * 1.02).astype(int).fillna(0)
+    
+    model = RandomForestClassifier(n_estimators=100)
+    model.fit(X, y)
+    
+    os.makedirs("data", exist_ok=True)
+    joblib.dump(model, MODEL_PATH)
+    return model
+
+def load_ai_model():
+    import joblib
+    if os.path.exists(MODEL_PATH):
+        return joblib.load(MODEL_PATH)
+    return None
+
+def predict_signal(df, model):
+    X = np.column_stack([df["rsi"].fillna(0), df["ma50"].fillna(0), df["ma200"].fillna(0)])
+    pred = model.predict(X[-1].reshape(1, -1))[0]
+    return "BUY" if pred == 1 else "SELL"
