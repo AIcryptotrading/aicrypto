@@ -1,21 +1,17 @@
-# AI Crypto Trading - Full Project (Paper-trade)
+AI Paper Trading — v1 (Safe paper trading)
 
-This repository contains a Streamlit app + utilities for paper trading, backtesting,
-supervised model starter, and placeholders for RL / HuggingFace integrations.
+This package is a self-contained Streamlit app for paper-trading with an AI starter model.
+Extract the ZIP and run the setup script for Windows, then run the app.
 
-**Quick start (local)**:
-1. Copy `config.yaml.sample` -> `config.yaml` and fill keys if needed.
-2. Create venv and install:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate
-   pip install -r requirements.txt
-   ```
-3. Run Streamlit:
-   ```bash
+How to run (Windows):
+1. Extract this ZIP to a folder, e.g. C:\aicrypto_paper_v1
+2. Double-click setup.bat OR run in Command Prompt:
+   setup.bat
+3. After setup completes, run:
+   venv\Scripts\activate
    streamlit run app.py
-   ```
 
-**Notes**:
-- This project is for educational / paper-trade use. Live trading requires secure key handling.
-- RL training and large models require GPU/cloud resources; heavy packages are optional.
+Notes:
+- This is PAPER-TRADING only (no real orders sent).
+- The AI is a starter (RandomForest) and a rule-based fallback. Train it using the UI.
+- If installations of some heavy libraries fail on Windows, install them manually.

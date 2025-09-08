@@ -1,58 +1,57 @@
-import requests
-import pandas as pd
-import numpy as np
-from datetime import datetime
+# utils.py - data fetch and indicators (lightweight)
+import pandas as pd, numpy as np
 
-BASE_URL = "https://api.binance.com"
-
-def fetch_klines(symbol: str, interval: str = "4h", limit: int = 500):
+def fetch_ohlcv_yf(symbol='BTC-USD', interval='1h', period='60d'):
     try:
-        url = f"{BASE_URL}/api/v3/klines"
-        params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        raw = r.json()
-        df = pd.DataFrame(raw, columns=[
-            "open_time","open","high","low","close","volume",
-            "close_time","quote_asset_volume","num_trades","taker_buy_base","taker_buy_quote","ignore"
-        ])
-        df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
-        df = df.set_index('open_time')
-        for c in ['open','high','low','close','volume']:
-            df[c] = df[c].astype(float)
+        import yfinance as yf
+        df = yf.download(symbol, period=period, interval=interval, progress=False)
+        if df.empty:
+            return pd.DataFrame()
+        df = df.reset_index()
+        df = df.rename(columns={'Datetime':'time','Date':'time','Open':'open','High':'high','Low':'low','Close':'close','Volume':'volume'})
+        df['time'] = pd.to_datetime(df['time'])
+        df = df[['time','open','high','low','close','volume']]
         return df
-    except Exception as e:
-        raise RuntimeError(f"fetch_klines error for {symbol}: {e}")
+    except Exception:
+        return pd.DataFrame()
 
-def compute_rsi(series: pd.Series, period: int = 14):
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    ma_up = up.ewm(com=period-1, adjust=False).mean()
-    ma_down = down.ewm(com=period-1, adjust=False).mean()
-    rs = ma_up / (ma_down + 1e-9)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+def fetch_ohlcv_ccxt(symbol='BTC/USDT', timeframe='1h', limit=500):
+    try:
+        import ccxt
+        ex = ccxt.binance({'enableRateLimit': True})
+        ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
+        df['time'] = pd.to_datetime(df['time'], unit='ms')
+        return df
+    except Exception:
+        return pd.DataFrame()
 
-def add_indicators(df: pd.DataFrame):
-    df = df.copy()
-    df['rsi14'] = compute_rsi(df['close'], period=14)
-    df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
-    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
-    df['ma200'] = df['close'].rolling(window=200, min_periods=1).mean()
-    high_low = df['high'] - df['low']
-    high_close = (df['high'] - df['close'].shift()).abs()
-    low_close = (df['low'] - df['close'].shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df['atr14'] = tr.rolling(14, min_periods=1).mean()
-    df['vol_ma20'] = df['volume'].rolling(20, min_periods=1).mean()
+def fetch_ohlcv(symbol='BTCUSDT', interval='1h', limit=500):
+    # try ccxt/binance first (local), else yfinance fallback
+    df = fetch_ohlcv_ccxt(symbol.replace('USDT','/USDT'), timeframe=interval, limit=limit)
+    if df is None or df.empty:
+        df = fetch_ohlcv_yf(symbol.replace('USDT','-USD'), interval=interval, period='120d')
     return df
 
-def last_price(symbol: str):
-    try:
-        url = BASE_URL + "/api/v3/ticker/price"
-        r = requests.get(url, params={"symbol": symbol.upper()}, timeout=5)
-        r.raise_for_status()
-        return float(r.json()['price'])
-    except Exception as e:
-        raise RuntimeError(f"last_price error {symbol}: {e}")
+def add_indicators(df):
+    df = df.copy()
+    if df.empty:
+        return df
+    df['close'] = df['close'].astype(float)
+    df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
+    df['ema25'] = df['close'].ewm(span=25, adjust=False).mean()
+    # RSI simple
+    delta = df['close'].diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    roll_up = up.ewm(com=13, adjust=False).mean()
+    roll_down = down.ewm(com=13, adjust=False).mean()
+    rs = roll_up / (roll_down + 1e-9)
+    df['rsi14'] = 100 - 100/(1+rs)
+    df['volume_ma20'] = df['volume'].rolling(window=20).mean().fillna(0)
+    return df
+
+def last_price(df):
+    if df is None or df.empty:
+        return None
+    return float(df['close'].iloc[-1])

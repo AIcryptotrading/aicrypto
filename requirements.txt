@@ -1,13 +1,10 @@
-streamlit>=1.20.0
-pandas>=1.5
-numpy>=1.22
-requests>=2.28
-pyyaml
+streamlit>=1.12
+pandas>=1.4
+numpy>=1.21
+plotly>=5.0
+scikit-learn>=1.0
+requests>=2.25
+yfinance>=0.1.70
+ccxt>=2.4.70
+ta>=0.10.1
 joblib
-scikit-learn
-matplotlib
-plotly
-ta
-python-dotenv
-python-binance
-shap  # optional - heavy

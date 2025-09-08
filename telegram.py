@@ -1,11 +1,13 @@
+# telegram.py - simple sender (optional)
 import requests
 
-def send_telegram(bot_token: str, chat_id: str, text: str):
-    if not bot_token or not chat_id:
+def send_telegram(token, chat_id, text):
+    if not token or not chat_id:
         return False
     try:
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        resp = requests.post(url, data={"chat_id": chat_id, "text": text})
-        return resp.ok
-    except Exception:
+        url = f'https://api.telegram.org/bot{token}/sendMessage'
+        r = requests.post(url, json={'chat_id': chat_id, 'text': text})
+        return r.ok
+    except Exception as e:
+        print('tg error', e)
         return False

@@ -1,118 +1,105 @@
+# app.py - Streamlit Paper Trading AI (safe)
 import streamlit as st
-import yaml, os, time
-from utils import fetch_klines, add_indicators, last_price
-from ai_models import train_supervised, load_supervised
-from trade_manager import place_paper_order, list_paper_orders, clear_paper_orders
+import pandas as pd, numpy as np, time
+from utils import fetch_ohlcv, add_indicators, last_price
+from ai_model import train_quick, load_model, predict
+from trade_manager import place_order, load_orders
+from backtest import run_backtest
 from telegram import send_telegram
+st.set_page_config(layout='wide', page_title='AI Paper Trader')
 
-st.set_page_config(page_title='AI Crypto Trader (Pro)', layout='wide')
-st.title('🤖 AI Crypto Trader — Pro (Paper-trade)')
+st.title('🤖 AI Paper Trader — Paper Mode (Safe)')
 
-# Load config if present
-if os.path.exists('config.yaml'):
-    cfg = yaml.safe_load(open('config.yaml'))
-else:
-    cfg = {}
-
+# Sidebar / settings
 st.sidebar.header('Settings')
-symbols_text = st.sidebar.text_input('Symbols (comma)', ','.join(cfg.get('default_symbols', ['BTCUSDT','ETHUSDT'])))
-symbols = [s.strip().upper() for s in symbols_text.split(',') if s.strip()]
-interval = st.sidebar.selectbox('Interval', ['15m','1h','4h','1d'], index=2)
-auto_scan = st.sidebar.checkbox('Auto-scan', value=cfg.get('auto_scan', False))
-scan_interval = st.sidebar.number_input('Auto-scan interval (sec)', value=cfg.get('auto_scan_interval_sec',900), step=60)
-paper_trade = st.sidebar.checkbox('Paper-trade (enabled)', value=cfg.get('paper_trade', True))
-tg_token = st.sidebar.text_input('Telegram token', value=cfg.get('telegram_token',''))
-tg_chat = st.sidebar.text_input('Telegram chat id', value=cfg.get('telegram_chat_id',''))
+symbols = st.sidebar.text_input('Symbols (comma)', 'BTCUSDT,ETHUSDT,BNBUSDT').split(',')
+interval = st.sidebar.selectbox('Interval', ['1h','4h','1d'], index=1)
+paper_balance = st.sidebar.number_input('Paper balance (USD)', value=1000.0)
+risk_pct = st.sidebar.number_input('Risk per trade (%)', value=1.0, min_value=0.1, max_value=10.0)
+max_open = st.sidebar.number_input('Max open orders', value=5, min_value=1, max_value=20)
+tg_token = st.sidebar.text_input('Telegram bot token (opt)', value='')
+tg_chat = st.sidebar.text_input('Telegram chat id (opt)', value='')
 
 st.sidebar.markdown('---')
-st.sidebar.subheader('Models (local)')
-train_sup_btn = st.sidebar.button('Train supervised (quick)')
-
-st.subheader('Market Watch')
-cols = st.columns(min(len(symbols), 6))
-prices = {}
-for i, sym in enumerate(symbols):
-    try:
-        p = last_price(sym)
-        prices[sym] = p
-        cols[i % len(cols)].metric(sym, f"{p:.8f}")
-    except Exception as e:
-        cols[i % len(cols)].write(f"{sym}: err")
-
-st.markdown('---')
-st.subheader('Scanner & AI suggestions')
-colL, colR = st.columns([3,1])
-with colR:
-    if st.button('Run scan now'):
-        run_scan = True
-    else:
-        run_scan = False
-    if train_sup_btn:
-        st.info('Training supervised model (this may take a minute)...')
-        try:
-            s = symbols[0]
-            df = fetch_klines(s, interval=interval, limit=1500)
+st.sidebar.subheader('AI Model')
+if st.sidebar.button('Train quick supervised model'):
+    with st.spinner('Training model...'):
+        s = symbols[0].strip()
+        df = fetch_ohlcv(s, interval=interval, limit=1000)
+        if df is None or df.empty:
+            st.error('No data to train for '+s)
+        else:
             df = add_indicators(df)
-            train_supervised(df)
-            st.success('Supervised model trained & saved.')
-        except Exception as e:
-            st.error(f'Train supervised error: {e}')
-with colL:
-    sup = load_supervised()
-    if auto_scan:
-        last_run = st.session_state.get('last_auto_scan', 0)
-        if time.time() - last_run > scan_interval:
-            run_scan = True
-            st.session_state['last_auto_scan'] = time.time()
-    if run_scan:
+            try:
+                train_quick(df)
+                st.success('Model trained and saved (models/supervised_rf.pkl)')
+            except Exception as e:
+                st.error('Train failed: '+str(e))
+
+st.sidebar.markdown('---')
+mode = st.sidebar.radio('Mode', ['Paper (Bot)','Paper (Manual)'])
+
+# Main layout
+col1, col2 = st.columns([3,1])
+
+with col2:
+    st.subheader('Paper Orders')
+    orders = load_orders()
+    if orders:
+        st.write(pd.DataFrame(orders).sort_values('time', ascending=False).head(10))
+    else:
+        st.info('No paper orders yet.')
+
+with col1:
+    st.subheader('Market Watch & Scanner')
+    if st.button('Run scan now'):
+        results = []
         for sym in symbols:
-            with st.expander(f"{sym}"):
-                try:
-                    df = fetch_klines(sym, interval=interval, limit=1000)
-                    df = add_indicators(df)
-                    st.write(f"Latest close: {df['close'].iloc[-1]:.8f}")
-                    st.line_chart(df['close'].tail(200))
-                    if sup:
-                        X = df[['rsi14','ema20','ema50','atr14','vol_ma20']].fillna(0).values
-                        pred = sup.predict(X[-1].reshape(1,-1))[0]
-                        suggestion = 'BUY' if pred==1 else 'HOLD/SELL'
-                    else:
-                        suggestion = 'No model'
-                    st.markdown(f"**Suggestion (supervised):** {suggestion}")
-                    if suggestion == 'BUY' and paper_trade:
-                        price = float(df['close'].iloc[-1])
-                        ord = place_paper_order(sym, 'BUY', price, size=1.0, note='AI sup')
-                        st.success(f"Placed paper order: {ord}")
-                        if tg_token and tg_chat:
-                            send_telegram(tg_token, tg_chat, f"Paper BUY {sym} @ {price}")
-                except Exception as e:
-                    st.error(f"{sym} scan error: {e}")
+            s = sym.strip()
+            df = fetch_ohlcv(s, interval=interval, limit=500)
+            if df is None or df.empty:
+                st.warning(f'No data for {s}')
+                continue
+            df = add_indicators(df)
+            sig = predict(df)
+            price = last_price(df)
+            # decide entry sizing
+            size_usd = (paper_balance * (risk_pct/100.0))
+            qty = round(size_usd / price, 6) if price>0 else 0
+            # check open orders limit
+            orders = load_orders()
+            open_orders = [o for o in orders if o['status']=='open'] if orders else []
+            if sig == 1 and len(open_orders) < max_open:
+                o = place_order(s, 'BUY', qty, price, note='AI signal')
+                results.append({'symbol':s,'side':'BUY','price':price,'qty':qty})
+                if tg_token and tg_chat:
+                    send_telegram(tg_token, tg_chat, f"AI placed PAPER BUY {s} @ {price}")
+            elif sig == 0:
+                results.append({'symbol':s,'side':'HOLD','price':price})
+        st.write('Scan results:')
+        st.write(pd.DataFrame(results))
+
+    st.markdown('---')
+    st.subheader('Chart (select symbol)')
+    sym_choice = st.selectbox('Symbol', [s.strip() for s in symbols])
+    dfc = fetch_ohlcv(sym_choice, interval=interval, limit=1000)
+    if dfc is None or dfc.empty:
+        st.error('No chart data')
+    else:
+        dfc = add_indicators(dfc)
+        st.line_chart(dfc.set_index('time')['close'].tail(200))
+        st.write(dfc[['time','close','ema9','ema25','rsi14']].tail(5))
 
 st.markdown('---')
-st.subheader('Paper Orders / History')
-ords = list_paper_orders()
-if ords:
-    st.table(ords[::-1])
-    if st.button('Clear paper orders'):
-        clear_paper_orders()
-        st.experimental_rerun()
-else:
-    st.info('No paper orders yet.')
-
-st.markdown('---')
-st.subheader('Manual Chart & Trendline (single symbol)')
-symbol_for_chart = st.selectbox('Choose symbol', symbols)
-if symbol_for_chart:
-    try:
-        df = fetch_klines(symbol_for_chart, interval=interval, limit=1000)
+st.subheader('Backtest (quick)')
+if st.button('Run quick backtest on first symbol'):
+    s = symbols[0].strip()
+    df = fetch_ohlcv(s, interval=interval, limit=2000)
+    if df is None or df.empty:
+        st.error('No data')
+    else:
         df = add_indicators(df)
-        import plotly.graph_objects as go
-        fig = go.Figure(data=[go.Candlestick(x=df.index[-200:], open=df['open'].iloc[-200:], high=df['high'].iloc[-200:], low=df['low'].iloc[-200:], close=df['close'].iloc[-200:])])
-        fig.add_trace(go.Scatter(x=df.index[-200:], y=df['ema20'].iloc[-200:], name='EMA20'))
-        fig.add_trace(go.Scatter(x=df.index[-200:], y=df['ema50'].iloc[-200:], name='EMA50'))
-        st.plotly_chart(fig, use_container_width=True)
-    except Exception as e:
-        st.error(f'Chart error: {e}')
-
-st.markdown('---')
-st.caption('Paper-trade only. Live trading requires secure key management and extra checks.')
+        def strategy(d): return 'LONG' if (d['close'].iloc[-1] > d['ema25'].iloc[-1] and d['rsi14'].iloc[-1]<70) else None
+        trades, final = run_backtest(df, strategy, initial_balance=paper_balance)
+        st.write('Trades:', len(trades), 'Final balance:', final)
+        st.write(trades)
